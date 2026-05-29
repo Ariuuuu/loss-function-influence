@@ -6,6 +6,7 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, random_split
 from sklearn.metrics import classification_report, confusion_matrix
 import numpy as np
+import wandb
 
 
 class MNIST(datasets.MNIST):
@@ -66,8 +67,8 @@ def train(model, data, criterion, optimizer, device, size):
         super_pred, digit_pred = model(img)
 
         loss_digit = criterion(digit_pred, digit)
-        # loss_super = criterion(super_pred, super)
-        loss = loss_digit # + 0.1*loss_super
+        loss_super = criterion(super_pred, super)
+        loss = 0.1*loss_digit + loss_super
 
         optimizer.zero_grad()
         loss.backward()
@@ -97,8 +98,8 @@ def evaluation(model, data, criterion, device, size,
         super_pred, digit_pred = model(img)
 
         loss_digit = criterion(digit_pred, digit)
-        # loss_super = criterion(super_pred, super)
-        loss = loss_digit # + 0.1*loss_super
+        loss_super = criterion(super_pred, super)
+        loss = 0.1 *loss_digit + loss_super
 
         correct_super += super_pred.argmax(1).eq(super).sum().item()
         correct_digit += digit_pred.argmax(1).eq(digit).sum().item()
@@ -153,17 +154,16 @@ test_loader = DataLoader(dataset=test_dataset, batch_size=32, num_workers=4)
 # Moving the model, data, labels to gpu
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+plotter = wandb.init(project="Hierarchical MNIST", config={"epochs": 20, "lr": 0.01, "scheduler": 1, "augmentation": 1})
 
 for epoch in range(20):
     training = train(model, train_loader, criterion, optimizer, device, train_size)
-    validitation = evaluation(model, val_loader, criterion, device, val_size)
-    scheduler.step(validitation["loss"])
+    validation = evaluation(model, val_loader, criterion, device, val_size)
+    scheduler.step(validation["loss"])
 
-    print(f"Epoch {epoch+1}\n"
-          f"Training results:\n"
-          f"Loss {training['loss']:.5f} | Superclass accuracy {training['super acc']:.3f}% | Digit accuracy {training['digit acc']:.3f}%\n"
-          f"Validation metrics:\n"
-          f"Loss {validitation['loss']:.5f} | Superclass accuracy {validitation['super acc']:.3f}% | Digit accuracy {validitation['digit acc']:.3f}%")
+    wandb.log({"loss/train": training['loss'], "loss/validation": validation['loss'], 
+               "super_accuracy/train": training['super acc'],'super_accuracy/validation': validation['super acc'],
+               "digit_accuracy/train": training['digit acc'], "digit_accuracy/validation": validation['digit acc']}, step=epoch)
 
 super_predictions = []
 super_labels = []
@@ -180,3 +180,4 @@ print(confusion_matrix(np.array(super_labels), np.array(super_predictions)))
 print("\n ======== Digit classification report: ========")
 print(classification_report(np.array(digit_labels), np.array(digit_predictions)))
 print(confusion_matrix(np.array(digit_labels), np.array(digit_predictions)))
+wandb.finish()
