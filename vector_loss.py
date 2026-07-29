@@ -3,13 +3,16 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision import transforms
 from torch.optim import SGD, lr_scheduler
-from torch.utils.data import random_split, DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from typing import Optional
 
-writer = SummaryWriter(log_dir='runs/vector_loss/norm2')
+np.random.seed(42)
+n = 2 # The norm to be later used
+writer = SummaryWriter(log_dir=f'runs/vector_loss/norm{n}')
 
 TRAIN_NPZ = '~/train_data.npz'
 TEST_NPZ  = '~/test_data.npz'
@@ -36,9 +39,55 @@ class ImageNetDataset(Dataset):
             img = self.transform(img)
         return img, superclass, label
 
-class Loader(DataLoader):
-    def __getitem__(self, key):
-        pass
+#This class is used to sample the batches used during training in order to ensure balance
+class BalancedBatchSampler(Sampler):
+    def __init__(self, labels, batch_size, drop_last=False):
+        self.labels = np.array(labels)
+        self.groups = np.unique(labels)
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+
+        self.per_group = self.batch_size // len(self.groups)
+        if self.per_group == 0:
+            raise ValueError("batch size must be >=  number of groups")
+
+        self.group_indices = {
+            g: np.where(self.labels == g)[0] for g in self.groups
+        }
+
+    def __iter__(self):
+        pools = {g: np.random.permutation(idx) for g, idx in self.group_indices.items()}
+        pointers = {g: 0 for g in self.groups}
+
+        while True:
+            batch = []
+
+            active_groups = [g for g in self.groups if pointers[g] < len(self.group_indices[g])]
+
+            if not active_groups:
+                return
+
+            num_active = len(active_groups)
+            base = self.batch_size // num_active
+            remainder = self.batch_size % num_active
+
+            for i, g in enumerate(active_groups):
+                alloc = base + (1 if i < remainder else 0)
+                start = pointers[g]
+                end = start + alloc
+
+                if end > len(self.group_indices[g]):
+                    end = len(self.group_indices[g])
+                batch.extend(pools[g][start:end])
+                pointers[g] = end
+
+            np.random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        min_group_size = min(len(idx) for idx in self.group_indices.values())
+        return min_group_size // self.per_group
+        
 # This class defines the NN used to perform the experiment
 class CNN(nn.Module):
     def __init__(self, num_superclasses=2):
@@ -50,7 +99,7 @@ class CNN(nn.Module):
             nn.MaxPool2d(2),
             nn.Dropout2d(0.25),
 
-            nn.Conv2d(64, 128, 5),
+            nn.Conv2d(64, 128, 3),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2),
@@ -72,8 +121,7 @@ class CNN(nn.Module):
         return superclass
 
 # Training pipeline
-def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, device):
-
+def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, norm: int, device):
     # Variable loss_norm serves to track the loss decay over epochs, train_loss is a vector to record each of the 25 classes loss.
     # Train count serves us as a tracker of how many batches had at least one instance of a class.
     # Class accuracy tracks the number of percentage of correctly predicted data, with class_count counting the total number of instances per class.
@@ -114,7 +162,7 @@ def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, d
             batch_class_count[id] = mask.sum()
 
         # Auxiliary variable batch_loss is used to calculate the norm
-        loss = torch.linalg.vector_norm(batch_loss, ord=np.inf)
+        loss = torch.linalg.vector_norm(batch_loss, ord=norm)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -135,7 +183,7 @@ def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, d
 
 # Evaluation pipeline
 @torch.no_grad()
-def evaluate(model: nn.Module, data: DataLoader, criterion, size: int, device,
+def evaluate(model: nn.Module, data: DataLoader, criterion, size: int, norm: int, device,
              predictions_list: Optional[list] = None, labels_list: Optional[list] = None):
     # Variable loss_norm serves to track the overall loss decay over epochs, eval_loss is a vector to record each of the 25 classes loss.
     # Eval count serves us as a tracker of how many batches had at least one instance of a class.
@@ -177,7 +225,7 @@ def evaluate(model: nn.Module, data: DataLoader, criterion, size: int, device,
             batch_class_count[id] += mask.sum()
 
         # Auxiliary variable batch_loss is used to calculate the norm
-        loss_norm += torch.linalg.vector_norm(batch_loss, ord=2).item()
+        loss_norm += torch.linalg.vector_norm(batch_loss, ord=norm).item()
         eval_loss += batch_loss.detach().cpu()
         eval_count += batch_count.cpu()
         class_accuracy += batch_class_accuracy.cpu()
@@ -212,23 +260,33 @@ X, Y, Y_orig = train_data['X'], train_data['Y'], train_data['Y_orig']
 
 # Preprocessing the data using the custom built class.
 full_dataset = ImageNetDataset(X, Y, Y_orig, transform=train_transform)
+labels = full_dataset.Y_orig
 
-#Splitting the train data into a train set and validation set
-train_size   = int(0.8 * len(full_dataset))
-val_size     = len(full_dataset) - train_size
-train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+#Splitting the train data into a train set and validation set where all classes share equal proportions
+train_idx, val_idx = train_test_split(np.arange(len(labels)), test_size=0.1, stratify=labels, random_state=42)
+train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
+val_dataset = torch.utils.data.Subset(full_dataset, val_idx)
+train_size = len(train_dataset)
+val_size = len(val_dataset)
 
-# apply test transform to validation split
-val_dataset.dataset.transform = test_transform
+# Defining a sampler for train data
+orig_train_data = train_dataset.dataset
+orig_train_indices = train_dataset.indices 
+training_sampler = BalancedBatchSampler(orig_train_data.Y_orig[orig_train_indices], 250)
+# Preparing train data
+train_loader = DataLoader(train_dataset,  batch_sampler=training_sampler,  num_workers=4)
 
-# Preparing train and validation data
-train_loader = DataLoader(train_dataset, batch_size=32,  shuffle=True,  num_workers=4)
-val_loader   = DataLoader(val_dataset,   batch_size=25, shuffle=False, num_workers=4)
+# Defining a sampler for validation data
+orig_val_data = val_dataset.dataset
+orig_val_indices = val_dataset.indices
+val_sampler = BalancedBatchSampler(orig_val_data.Y_orig[orig_val_indices], 250)
+# Preparing validation data
+val_loader   = DataLoader(val_dataset,  batch_sampler=val_sampler, num_workers=4)
 
 # Loading, unpacking, preprocessing and preparing the test data
 test_data    = np.load(TEST_NPZ)                      
 test_dataset = ImageNetDataset(test_data['X'], test_data['Y'], test_data['Y_orig'], transform=test_transform)
-test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+test_loader  = DataLoader(test_dataset, batch_size=250, shuffle=False, num_workers=4)
 
 # Defining model, loss criteria, optimizer, scheduler and determinig device
 device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -242,16 +300,19 @@ print(f"Train: {train_size} | Val: {val_size} | Test: {len(test_dataset)}\n")
 
 # Training loop
 for epoch in range(20):
-    training   = train(model, train_loader, criterion, optimizer, train_size, device)
-    validation = evaluate(model, val_loader, criterion, val_size, device)
+    training   = train(model, train_loader, criterion, optimizer, train_size, n, device)
+    validation = evaluate(model, val_loader, criterion, val_size, n, device)
     scheduler.step(validation["Loss norm"])
+    test = evaluate(model, test_loader, criterion, len(test_dataset), n, device)
 
     # Keeping track of training by providing some data to the human eye
     print(f"Epoch {epoch+1:02d}:\n"
           f"Training Loss Norm {training['Loss Norm']:.4f} | "
           f"Train Acc {training['Accuracy']:.2f}\n"
           f"Validation Loss Norm {validation['Loss norm']:.4f} | "
-          f"Validation Acc {validation['Accuracy']:.2f}")
+          f"Validation Acc {validation['Accuracy']:.2f}\n"
+          f"Test Loss Norm {test['Loss norm']:.4f} | "
+          f"Test Acc {test['Accuracy']:.2f}")
     
     # Using Tensorboard to record more detailed insights on training and validation during epochs
     for i in range(len(training['Loss'])):
@@ -259,18 +320,14 @@ for epoch in range(20):
         writer.add_scalar(f'loss/validation_class_{i}', validation['Loss'][i].item(), epoch)
         writer.add_scalar(f'accuracy/train_class{i}', training['Class Accuracy'][i].item(), epoch)
         writer.add_scalar(f'accuracy/validation_class_{i}', validation['Class Accuracy'][i].item(), epoch) 
+        writer.add_scalar(f'test_accuracy/test_class{i}', test['Class Accuracy'][i].item(), epoch)
+        writer.add_scalar(f'test_ovr_acc/test', test['Accuracy'], epoch)
 
 super_predictions = []
 super_labels      = []
 
-test_metrics = evaluate(model, test_loader, criterion, len(test_dataset),
-                        device, super_predictions, super_labels)
-
-print("\n======== Test results: =========\n"
-      f"Loss {test_metrics['Loss norm']:.4f} | Accuracy {test_metrics['Accuracy']:.2f}")
-print("\n======== Per class test results: ========\n")
-for i in range(25):
-    print(f"Loss {test_metrics['Loss'][i]:.4f} | Accuracy {test_metrics['Class Accuracy']:.2f}")
+test_metrics = evaluate(model, test_loader, criterion, len(test_dataset), 
+                        n, device, super_predictions, super_labels)
 
 print("\n======== Classification report: ========")
 print(classification_report(np.array(super_labels), np.array(super_predictions),
