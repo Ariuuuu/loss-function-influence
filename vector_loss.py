@@ -121,7 +121,7 @@ class CNN(nn.Module):
         return superclass
 
 # Training pipeline
-def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, norm: int, device):
+def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, norm: int, epoch: int, device):
     # Variable loss_norm serves to track the loss decay over epochs, train_loss is a vector to record each of the 25 classes loss.
     # Train count serves us as a tracker of how many batches had at least one instance of a class.
     # Class accuracy tracks the number of percentage of correctly predicted data, with class_count counting the total number of instances per class.
@@ -132,6 +132,7 @@ def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, n
     class_accuracy = torch.zeros(25)
     class_count = torch.zeros(25)
     correct = 0
+    step = 1
 
     model.to(device)
     model.train()
@@ -161,6 +162,10 @@ def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, n
             batch_class_accuracy[id] += super_out[mask].argmax(1).eq(superclasses[mask]).sum().item()
             batch_class_count[id] = mask.sum()
 
+            if epoch<=20:
+                writer.add_scalar(f"batch_loss/train_class{id}", class_loss, epoch*1000+step)
+                writer.add_scalar(f"batch_accuracy/train_class{id}", batch_class_accuracy[id], epoch*1000+step)
+
         # Auxiliary variable batch_loss is used to calculate the norm
         loss = torch.linalg.vector_norm(batch_loss, ord=norm)
         optimizer.zero_grad()
@@ -183,8 +188,8 @@ def train(model: nn.Module, data: DataLoader, criterion, optimizer, size: int, n
 
 # Evaluation pipeline
 @torch.no_grad()
-def evaluate(model: nn.Module, data: DataLoader, criterion, size: int, norm: int, device,
-             predictions_list: Optional[list] = None, labels_list: Optional[list] = None):
+def evaluate(model: nn.Module, data: DataLoader, criterion, size: int, norm: int, epoch: int, device,
+             predictions_list: Optional[list] = None, labels_list: Optional[list] = None, test: bool = False):
     # Variable loss_norm serves to track the overall loss decay over epochs, eval_loss is a vector to record each of the 25 classes loss.
     # Eval count serves us as a tracker of how many batches had at least one instance of a class.
     # Class accuracy tracks the number of percentage of correctly predicted data, with class_count counting the total number of instances per class.
@@ -195,6 +200,7 @@ def evaluate(model: nn.Module, data: DataLoader, criterion, size: int, norm: int
     class_accuracy = torch.zeros(25)
     class_count = torch.zeros(25)
     correct    = 0
+    step = 1
 
     model.to(device)
     model.eval()
@@ -223,6 +229,14 @@ def evaluate(model: nn.Module, data: DataLoader, criterion, size: int, norm: int
             batch_count[id] += 1
             batch_class_accuracy[id] += super_out[mask].argmax(1).eq(superclasses[mask]).sum().item()
             batch_class_count[id] += mask.sum()
+
+            if epoch<=20:
+                if test:
+                    writer.add_scalar(f"batch_loss/test_class{id}", class_loss, epoch*100+step)
+                    writer.add_scalar(f"batch_accuracy/test_class{id}", batch_class_accuracy[id] / batch_class_count[id], epoch*100+step)
+                else:
+                    writer.add_scalar(f"batch_loss/val_class{id}", class_loss, epoch*100+step)
+                    writer.add_scalar(f"batch_accuracy/val_class{id}", batch_class_accuracy[id] / batch_class_count[id], epoch*100+step)
 
         # Auxiliary variable batch_loss is used to calculate the norm
         loss_norm += torch.linalg.vector_norm(batch_loss, ord=norm).item()
@@ -299,11 +313,11 @@ print(f"Training on: {device}")
 print(f"Train: {train_size} | Val: {val_size} | Test: {len(test_dataset)}\n")
 
 # Training loop
-for epoch in range(20):
-    training   = train(model, train_loader, criterion, optimizer, train_size, n, device)
-    validation = evaluate(model, val_loader, criterion, val_size, n, device)
+for epoch in range(100):
+    training   = train(model, train_loader, criterion, optimizer, train_size, n, epoch+1, device)
+    validation = evaluate(model, val_loader, criterion, val_size, n, epoch+1, device)
     scheduler.step(validation["Loss norm"])
-    test = evaluate(model, test_loader, criterion, len(test_dataset), n, device)
+    test = evaluate(model, test_loader, criterion, len(test_dataset), n, epoch+1, device)
 
     # Keeping track of training by providing some data to the human eye
     print(f"Epoch {epoch+1:02d}:\n"
@@ -327,7 +341,7 @@ super_predictions = []
 super_labels      = []
 
 test_metrics = evaluate(model, test_loader, criterion, len(test_dataset), 
-                        n, device, super_predictions, super_labels)
+                        n, epoch+1, device, super_predictions, super_labels)
 
 print("\n======== Classification report: ========")
 print(classification_report(np.array(super_labels), np.array(super_predictions),
