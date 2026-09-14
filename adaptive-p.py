@@ -26,7 +26,6 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 # This class transforms the data from the npz folders ready to be loaded on to the model.
 class ImageNetDataset(Dataset):
     def __init__(self, X: np.ndarray, Y: np.ndarray, Y_orig: np.ndarray, transform=None):
@@ -97,6 +96,35 @@ class BalancedBatchSampler(Sampler):
     def __len__(self):
         min_group_size = min(len(idx) for idx in self.group_indices.values())
         return min_group_size // self.per_group
+
+class pNormScheduler():
+    """This class schedules the norm order which is used to calculate the loss."""
+
+    def __init__(self, norm, factor=0.9, threshold=0.05, patience=5, min_norm=2.0, mode: str = 'min'):
+        self.norm = norm
+        self.factor = factor
+        self.threshold = threshold
+        self.patience = patience
+        self.min_norm = min_norm
+        self.mode = mode
+        self.streak = 0
+        self.best = np.inf if self.mode == 'min' else -np.inf
+
+    def step(self, loss):
+        improved = (loss < self.best - self.threshold) if self.mode == 'min' \
+                   else (loss > self.best + self.threshold)
+
+        if improved:
+            self.best = loss
+            self.streak = 0
+        else:
+            self.streak += 1
+
+        if self.streak >= self.patience:
+            self.norm = max(self.norm * self.factor, self.min_norm)
+            self.streak = 0
+
+        return self.norm
 
 # This class defines the NN used to perform the experiment
 class CNN(nn.Module):
@@ -244,7 +272,6 @@ def evaluate(model: nn.Module, data: DataLoader, criterion, size: int, norm: int
         "Dog Accuracy": dog_acc
     }
 
-
 def load_raw_data(train_npz: str, test_npz: str):
     """Loads the .npz files once so every (norm, seed) run reuses the same
     arrays instead of hitting disk again on every run."""
@@ -253,12 +280,12 @@ def load_raw_data(train_npz: str, test_npz: str):
     return (train_data['X'], train_data['Y'], train_data['Y_orig'],
             test_data['X'],  test_data['Y'],  test_data['Y_orig'])
 
-
-def run_experiment(norm_value: int, seed: int,
-                    X_train, Y_train, Y_orig_train,
+def run_experiment(seed: int, X_train, Y_train, Y_orig_train,
                     X_test, Y_test, Y_orig_test,
                     epochs: int = 100, device=None, num_workers: int = 0):
     """Runs one full train/val/test cycle for a fixed norm value and seed.
+    The norm scheduler is being used so remember to update lines 299, 304, 339 and 
+    356 if you want to run a different signal or hyperparameter configuration.
 
     num_workers defaults to 0 on purpose: with several of these running
     concurrently on a single-CPU-core node (one process per GPU), spawning
@@ -268,8 +295,13 @@ def run_experiment(norm_value: int, seed: int,
 
     set_seed(seed)
 
+    # Change this line if you want to start with a different norm value
+    norm_value=20
+
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    writer = SummaryWriter(log_dir=f'runs/vector_loss/norm{norm_value}_seed{seed}')
+
+    # Manually change the last folder name as to represent the signal you are testing
+    writer = SummaryWriter(log_dir=f'runs/vector_loss/Scheduler/val_loss_seed{seed}')
     gpu_transforms = v2.Compose([
     v2.RandomHorizontalFlip(p=0.5),
     v2.RandomRotation(degrees=10),
@@ -303,6 +335,9 @@ def run_experiment(norm_value: int, seed: int,
     optimizer = SGD(model.parameters(), lr=0.01, momentum=0.9)
     scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=3)
 
+    # Edit the factor, threshold and patience parameters
+    norm_scheduler = pNormScheduler(norm_value, factor=0.7, threshold=0.01, patience=10, min_norm=2)
+
     print(f"\n=== norm={norm_value} | seed={seed} | device={device} ===")
     print(f"Train: {train_size} | Val: {val_size} | Test: {len(test_dataset)}\n")
 
@@ -311,6 +346,15 @@ def run_experiment(norm_value: int, seed: int,
         validation = evaluate(model, val_loader, criterion, val_size, norm_value, epoch+1, device, writer)
         scheduler.step(validation["Loss norm"])
         test = evaluate(model, test_loader, criterion, len(test_dataset), norm_value, epoch+1, device, writer)
+
+        # Swap validation['Loss norm'] with any of the following, based on the training signal you want to use for monitoring plateaus or leave it if 
+        # you want to use the overall validation loss as the monitored signal :
+        # worst performing group: validation['Loss'][20].item()
+        # top 2 worst group: torch.linalg.vector_norm(validation['Loss'][20:22], ord=norm_value)
+        # top 3 worst group: torch.linalg.vector_norm(validation['Loss'][20:23], ord=norm_value)
+        # top 4 worst group: torch.linalg.vector_norm(torch.cat([validation['Loss'][20:23], validation['Loss'][24]]), ord=norm_value) 
+        # top 5 worst group: torch.linalg.vector_norm(torch.cat([validation['Loss'][20:23], validation['Loss'][24], validation['Loss'][16]]), ord=norm_value)
+        norm_value = norm_scheduler.step(validation['Loss norm'])
 
         for i in range(len(training['Loss'])):
             writer.add_scalar(f'loss/train_class_{i}', training['Loss'][i].item(), epoch)
@@ -331,7 +375,7 @@ def run_experiment(norm_value: int, seed: int,
                                          target_names=['cat', 'dog'], output_dict=True)
     cm = confusion_matrix(np.array(super_labels), np.array(super_predictions))
 
-    print(f"\n======== norm={norm_value} seed={seed} - Classification report: ========")
+    print(f"\n======== Scheduler val loss seed={seed} - Classification report: ========")
     print(classification_report(np.array(super_labels), np.array(super_predictions), target_names=['cat', 'dog']))
     print(cm)
 
@@ -358,17 +402,16 @@ def _init_worker(gpu_queue, train_npz, test_npz):
 
 
 def _run_one(args):
-    norm_value, seed, epochs, num_workers, log_batches = args
+    seed, epochs, num_workers, log_batches = args
     X_train, Y_train, Y_orig_train, X_test, Y_test, Y_orig_test = _worker_data
     device = torch.device(f'cuda:{_worker_gpu_id}')
 
-    print(f"[GPU {_worker_gpu_id}] starting norm={norm_value} seed={seed}")
-    result = run_experiment(norm_value, seed,
-                             X_train, Y_train, Y_orig_train,
+    print(f"[GPU {_worker_gpu_id}] starting Scheduler seed={seed}")
+    result = run_experiment(seed, X_train, Y_train, Y_orig_train,
                              X_test, Y_test, Y_orig_test,
                              epochs=epochs, device=device,
                              num_workers=num_workers, log_batches=log_batches)
-    print(f"[GPU {_worker_gpu_id}] finished norm={norm_value} seed={seed}")
+    print(f"[GPU {_worker_gpu_id}] finished Scheduler seed={seed}")
     return result
 
 
@@ -383,10 +426,10 @@ def save_results(results, out_path):
             with open(out_path) as f:
                 existing = json.load(f)
         except (json.JSONDecodeError, OSError):
-            existing = []  
+            existing = [] 
  
-    merged = {(r['norm'], r['seed']): r for r in existing}
-    merged.update({(r['norm'], r['seed']): r for r in results})
+    merged = {('Scheduler val loss', r['seed']): r for r in existing}
+    merged.update({('Scheduler val loss', r['seed']): r for r in results})
     merged_list = sorted(merged.values(), key=lambda r: (r['norm'], r['seed']))
  
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -396,7 +439,7 @@ def save_results(results, out_path):
     return merged_list
  
  
-def run_sweep_parallel(norm_values, seeds, train_npz=TRAIN_NPZ, test_npz=TEST_NPZ,
+def run_sweep_parallel(seeds, train_npz=TRAIN_NPZ, test_npz=TEST_NPZ,
                         epochs=100, num_gpus=torch.cuda.device_count(), num_workers=0,
                         results_path='runs/vector_loss/sweep_results.json'):
     """Runs every (norm, seed) combination across num_gpus GPUs in parallel,
@@ -411,8 +454,7 @@ def run_sweep_parallel(norm_values, seeds, train_npz=TRAIN_NPZ, test_npz=TEST_NP
         gpu_queue.put(gpu_id)
  
     tasks = [
-        (norm_value, seed, epochs, num_workers)
-        for norm_value in norm_values
+        (seed, epochs, num_workers)
         for seed in seeds
     ]
  
@@ -424,7 +466,6 @@ def run_sweep_parallel(norm_values, seeds, train_npz=TRAIN_NPZ, test_npz=TEST_NP
 
 if __name__ == '__main__':
     # ---- sweep configuration: edit these ----
-    norm_values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, np.inf]
     seeds       = [0, 1, 2, 3, 4, 5, 6, 7, 8]
     epochs      = 100
     # ------------------------------------------
@@ -432,19 +473,11 @@ if __name__ == '__main__':
     X_train, Y_train, Y_orig_train, X_test, Y_test, Y_orig_test = load_raw_data(TRAIN_NPZ, TEST_NPZ)
 
     all_results = []
-    for norm_value in norm_values:
-        for seed in seeds:
-            result = run_experiment(norm_value, seed,
-                                     X_train, Y_train, Y_orig_train,
-                                     X_test, Y_test, Y_orig_test,
-                                     epochs=epochs)
-            all_results.append(result)
+    for seed in seeds:
+        result = run_experiment(seed, X_train, Y_train, Y_orig_train,
+                                 X_test, Y_test, Y_orig_test,
+                                 epochs=epochs)
+        all_results.append(result)
 
     # Persist the full sweep so it can be analyzed later without re-training
     all_results = save_results(all_results, 'runs/vector_loss/sweep_results.json')
-
-    # Quick summary: mean/std test accuracy per norm value, across seeds
-    print("\n======== Sweep summary (test accuracy, mean ± std over seeds) ========")
-    for norm_value in norm_values:
-        accs = [r['test_accuracy'] for r in all_results if r['norm'] == norm_value]
-        print(f"norm={norm_value}: {np.mean(accs):.4f} ± {np.std(accs):.4f}  (n={len(accs)} seeds)")
